@@ -1892,6 +1892,48 @@ class TestSetFlowRunState:
         )
         assert run.state.type == StateType.CANCELLING
 
+    async def test_starting_a_flow_run_cancelled_before_it_started_is_aborted(
+        self, flow: Flow, client: AsyncClient, session: AsyncSession
+    ):
+        """The runtime a worker launched can start after its flow run was
+        cancelled; it must not get to run the flow."""
+        flow_run = await models.flow_runs.create_flow_run(
+            session=session,
+            flow_run=schemas.core.FlowRun(
+                flow_id=flow.id,
+                flow_version="1.0",
+                state=schemas.states.Pending(),
+            ),
+        )
+        await session.commit()
+        response = await client.patch(
+            f"/flow_runs/{flow_run.id}", json=dict(infrastructure_pid="my-pid-42")
+        )
+        assert response.status_code == 204, response.text
+        for state_type in ("CANCELLING", "CANCELLED"):
+            response = await client.post(
+                f"/flow_runs/{flow_run.id}/set_state",
+                json=dict(state=dict(type=state_type)),
+            )
+            assert response.status_code == 201, response.text
+            api_response = OrchestrationResult.model_validate(response.json())
+            assert api_response.status == responses.SetStateStatus.ACCEPT
+
+        response = await client.post(
+            f"/flow_runs/{flow_run.id}/set_state",
+            json=dict(state=dict(type="RUNNING", name="Running")),
+        )
+
+        assert response.status_code == 200, response.text
+        api_response = OrchestrationResult.model_validate(response.json())
+        assert api_response.status == responses.SetStateStatus.ABORT
+        flow_run_id = flow_run.id
+        session.expire(flow_run)
+        run = await models.flow_runs.read_flow_run(
+            session=session, flow_run_id=flow_run_id
+        )
+        assert run.state.type == StateType.CANCELLED
+
     async def test_cancelling_a_paused_flow_run_with_expired_timeout_is_accepted(
         self, flow: Flow, client: AsyncClient, session: AsyncSession
     ):

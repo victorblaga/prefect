@@ -35,6 +35,7 @@ from prefect.server.orchestration.core_policy import (
     CacheRetrieval,
     CopyScheduledTime,
     CopyTaskParametersID,
+    CoreFlowPolicy,
     EnforceCancellingToCancelledTransition,
     EnsureOnlyScheduledFlowsMarkedLate,
     HandleFlowTerminalStateTransitions,
@@ -46,6 +47,7 @@ from prefect.server.orchestration.core_policy import (
     PreventPendingTransitions,
     PreventResultDataLoss,
     PreventRunningTasksFromStoppedFlows,
+    PreventStartingFlowRunsCancelledBeforeStart,
     ReleaseFlowConcurrencySlots,
     ReleaseTaskConcurrencySlots,
     RemoveDeploymentConcurrencyLeaseForOldClientVersions,
@@ -3756,6 +3758,361 @@ class TestBypassCancellingFlowRunsWithNoInfra:
 
         assert ctx.response_status == SetStateStatus.ACCEPT
         assert ctx.validated_state_type == states.StateType.CANCELLING
+
+
+class TestPreventStartingFlowRunsCancelledBeforeStart:
+    async def flow_run_with_history(
+        self,
+        session: AsyncSession,
+        flow: orm.Flow,
+        history: list[StateType],
+        infrastructure_pid: str | None = "my-pid-42",
+    ) -> tuple[orm.FlowRun, states.State]:
+        """Create a flow run whose states, oldest first, are `history`."""
+        flow_run = await flow_runs.create_flow_run(
+            session=session,
+            flow_run=schemas.core.FlowRun(
+                flow_id=flow.id, infrastructure_pid=infrastructure_pid
+            ),
+        )
+        first_state_at = now("UTC") - timedelta(minutes=10)
+        for offset, state_type in enumerate(history):
+            result = await flow_runs.set_flow_run_state(
+                session=session,
+                flow_run_id=flow_run.id,
+                state=states.State(
+                    type=state_type,
+                    timestamp=first_state_at + timedelta(seconds=offset),
+                ),
+                force=True,
+            )
+        await session.commit()
+        assert result.state is not None
+        return flow_run, result.state
+
+    async def propose_running(
+        self, session: AsyncSession, flow_run: orm.FlowRun, initial_state: states.State
+    ) -> FlowOrchestrationContext:
+        ctx = FlowOrchestrationContext(
+            session=session,
+            run=flow_run,
+            initial_state=initial_state,
+            proposed_state=states.Running(),
+        )
+        async with PreventStartingFlowRunsCancelledBeforeStart(
+            ctx, initial_state.type, StateType.RUNNING
+        ) as ctx:
+            await ctx.validate_proposed_state()
+        return ctx
+
+    @pytest.mark.parametrize(
+        "history",
+        [
+            [StateType.PENDING, StateType.CANCELLING, StateType.CANCELLED],
+            # cancelled by proposing CANCELLED directly, without going through
+            # CANCELLING
+            [StateType.PENDING, StateType.CANCELLED],
+            # a retry that was cancelled before it ran
+            [
+                StateType.SCHEDULED,
+                StateType.PENDING,
+                StateType.RUNNING,
+                StateType.SCHEDULED,
+                StateType.PENDING,
+                StateType.CANCELLING,
+                StateType.CANCELLED,
+            ],
+            # a new attempt forced to Pending while the previous one was still
+            # running, as calling `InfrastructureBoundFlow.retry()` on it does
+            [
+                StateType.PENDING,
+                StateType.RUNNING,
+                StateType.PENDING,
+                StateType.CANCELLING,
+                StateType.CANCELLED,
+            ],
+        ],
+        ids=[
+            "cancelled",
+            "cancelled-directly",
+            "retry-cancelled",
+            "forced-pending-cancelled",
+        ],
+    )
+    async def test_aborts_starting_attempt_cancelled_before_it_ran(
+        self, session: AsyncSession, flow: orm.Flow, history: list[StateType]
+    ):
+        flow_run, cancelled = await self.flow_run_with_history(session, flow, history)
+
+        ctx = await self.propose_running(session, flow_run, cancelled)
+
+        assert ctx.response_status == SetStateStatus.ABORT
+        assert ctx.response_details.reason == (
+            "Flow run was cancelled before it started; it cannot start without "
+            "being rescheduled."
+        )
+
+    @pytest.mark.parametrize(
+        "history",
+        [
+            [
+                StateType.PENDING,
+                StateType.RUNNING,
+                StateType.CANCELLING,
+                StateType.CANCELLED,
+            ],
+            # rescheduled after an attempt that ran was cancelled
+            [
+                StateType.SCHEDULED,
+                StateType.PENDING,
+                StateType.RUNNING,
+                StateType.CANCELLING,
+                StateType.CANCELLED,
+            ],
+            # final states forced over a final state, as cancellation and crash
+            # handling can do, do not begin an attempt
+            [
+                StateType.PENDING,
+                StateType.RUNNING,
+                StateType.CANCELLING,
+                StateType.CANCELLED,
+                StateType.CANCELLED,
+            ],
+            [
+                StateType.PENDING,
+                StateType.RUNNING,
+                StateType.FAILED,
+                StateType.CANCELLED,
+            ],
+            [
+                StateType.PENDING,
+                StateType.RUNNING,
+                StateType.CRASHED,
+                StateType.CANCELLED,
+            ],
+            [
+                StateType.PENDING,
+                StateType.RUNNING,
+                StateType.PAUSED,
+                StateType.CANCELLING,
+                StateType.CANCELLED,
+            ],
+            # created in a Running state, without a Scheduled or Pending state
+            [StateType.RUNNING, StateType.CANCELLING, StateType.CANCELLED],
+        ],
+        ids=[
+            "cancelled-while-running",
+            "scheduled-run-cancelled-while-running",
+            "cancelled-twice",
+            "cancelled-after-failing",
+            "cancelled-after-crashing",
+            "cancelled-while-paused",
+            "created-running",
+        ],
+    )
+    async def test_accepts_starting_attempt_that_ran(
+        self, session: AsyncSession, flow: orm.Flow, history: list[StateType]
+    ):
+        flow_run, cancelled = await self.flow_run_with_history(session, flow, history)
+
+        ctx = await self.propose_running(session, flow_run, cancelled)
+
+        assert ctx.response_status == SetStateStatus.ACCEPT
+
+    @pytest.mark.parametrize(
+        "history, other_history, expected",
+        [
+            # another flow run that ran does not make this attempt one that ran
+            (
+                [StateType.SCHEDULED, StateType.PENDING, StateType.CANCELLED],
+                [StateType.SCHEDULED, StateType.PENDING, StateType.RUNNING],
+                SetStateStatus.ABORT,
+            ),
+            # another flow run that was rescheduled does not begin a new attempt here
+            (
+                [
+                    StateType.SCHEDULED,
+                    StateType.PENDING,
+                    StateType.RUNNING,
+                    StateType.CANCELLING,
+                    StateType.CANCELLED,
+                ],
+                [
+                    StateType.SCHEDULED,
+                    StateType.PENDING,
+                    StateType.RUNNING,
+                    StateType.FAILED,
+                    StateType.SCHEDULED,
+                ],
+                SetStateStatus.ACCEPT,
+            ),
+        ],
+        ids=["other-run-ran", "other-run-rescheduled"],
+    )
+    async def test_only_the_flow_runs_own_states_count(
+        self,
+        session: AsyncSession,
+        flow: orm.Flow,
+        history: list[StateType],
+        other_history: list[StateType],
+        expected: SetStateStatus,
+    ):
+        flow_run, cancelled = await self.flow_run_with_history(session, flow, history)
+        await self.flow_run_with_history(session, flow, other_history)
+
+        ctx = await self.propose_running(session, flow_run, cancelled)
+
+        assert ctx.response_status == expected
+
+    @pytest.mark.parametrize(
+        "previous_final_state_type",
+        [
+            StateType.COMPLETED,
+            StateType.FAILED,
+            StateType.CRASHED,
+            StateType.CANCELLED,
+        ],
+    )
+    async def test_aborts_starting_infrastructure_bound_retry_cancelled_before_it_ran(
+        self,
+        session: AsyncSession,
+        flow: orm.Flow,
+        previous_final_state_type: StateType,
+    ):
+        """Retrying an infrastructure-bound flow run forces it from any final state
+        to Pending."""
+        flow_run, cancelled = await self.flow_run_with_history(
+            session,
+            flow,
+            [
+                StateType.PENDING,
+                StateType.RUNNING,
+                previous_final_state_type,
+                StateType.PENDING,
+                StateType.CANCELLING,
+                StateType.CANCELLED,
+            ],
+        )
+
+        ctx = await self.propose_running(session, flow_run, cancelled)
+
+        assert ctx.response_status == SetStateStatus.ABORT
+
+    async def test_aborts_starting_retry_cancelled_while_awaiting_it(
+        self, session: AsyncSession, flow: orm.Flow
+    ):
+        """A retry is scheduled by rejecting the Failed state, so no final state
+        separates the attempt that ran from the retry."""
+        flow_run = await flow_runs.create_flow_run(
+            session=session,
+            flow_run=schemas.core.FlowRun(
+                flow_id=flow.id,
+                infrastructure_pid="my-pid-42",
+                empirical_policy=schemas.core.FlowRunPolicy(retries=1),
+                state=states.Pending(),
+            ),
+        )
+        await session.commit()
+
+        results: list[tuple[SetStateStatus, str | None]] = []
+        for make_state in (
+            states.Running,
+            states.Failed,
+            states.Cancelling,
+            states.Cancelled,
+            states.Running,
+        ):
+            result = await flow_runs.set_flow_run_state(
+                session=session,
+                flow_run_id=flow_run.id,
+                state=make_state(),
+                flow_policy=CoreFlowPolicy,
+            )
+            await session.commit()
+            results.append((result.status, result.state and result.state.name))
+
+        assert results == [
+            (SetStateStatus.ACCEPT, "Running"),
+            (SetStateStatus.REJECT, "AwaitingRetry"),
+            (SetStateStatus.ACCEPT, "Cancelling"),
+            (SetStateStatus.ACCEPT, "Cancelled"),
+            (SetStateStatus.ABORT, "Cancelled"),
+        ]
+
+    @pytest.mark.parametrize(
+        "final_state_type",
+        [StateType.FAILED, StateType.CRASHED, StateType.COMPLETED],
+    )
+    async def test_does_not_check_other_final_states(
+        self, session: AsyncSession, flow: orm.Flow, final_state_type: StateType
+    ):
+        flow_run, final_state = await self.flow_run_with_history(
+            session, flow, [StateType.PENDING, final_state_type]
+        )
+
+        ctx = await self.propose_running(session, flow_run, final_state)
+
+        assert ctx.response_status == SetStateStatus.ACCEPT
+
+    async def test_rescheduling_lets_a_flow_run_cancelled_before_it_started_run(
+        self, session: AsyncSession, deployment: orm.Deployment
+    ):
+        flow_run = await flow_runs.create_flow_run(
+            session=session,
+            flow_run=schemas.core.FlowRun(
+                flow_id=deployment.flow_id,
+                deployment_id=deployment.id,
+                infrastructure_pid="my-pid-42",
+                state=states.Pending(),
+            ),
+        )
+        await session.commit()
+
+        for state in (
+            states.Cancelling(),
+            states.Cancelled(),
+            states.Scheduled(),
+            states.Pending(),
+            states.Running(),
+        ):
+            result = await flow_runs.set_flow_run_state(
+                session=session,
+                flow_run_id=flow_run.id,
+                state=state,
+                flow_policy=CoreFlowPolicy,
+            )
+            await session.commit()
+            assert result.status == SetStateStatus.ACCEPT, (state.type, result.details)
+
+    async def test_accepts_starting_flow_run_without_infrastructure_pid(
+        self, session: AsyncSession, flow: orm.Flow
+    ):
+        flow_run, cancelled = await self.flow_run_with_history(
+            session,
+            flow,
+            [StateType.PENDING, StateType.CANCELLING, StateType.CANCELLED],
+            infrastructure_pid=None,
+        )
+
+        ctx = await self.propose_running(session, flow_run, cancelled)
+
+        assert ctx.response_status == SetStateStatus.ACCEPT
+
+    async def test_forced_transitions_are_not_checked(
+        self, session: AsyncSession, flow: orm.Flow
+    ):
+        flow_run, _ = await self.flow_run_with_history(
+            session, flow, [StateType.PENDING, StateType.CANCELLED]
+        )
+
+        result = await flow_runs.set_flow_run_state(
+            session=session,
+            flow_run_id=flow_run.id,
+            state=states.Running(),
+            force=True,
+        )
+
+        assert result.status == SetStateStatus.ACCEPT
 
 
 class TestPreventDuplicateTransitions:

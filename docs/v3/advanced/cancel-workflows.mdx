@@ -118,6 +118,8 @@ Do not force a running flow run directly into the terminal `CANCELLED` state
 to request cancellation.
 `CANCELLING` signals that execution should stop and infrastructure should be cleaned up.
 `CANCELLED` is the final state after cancellation is complete, or when there is no running infrastructure to stop.
+A worker-launched flow run that is cancelled before it starts does not run: if its infrastructure starts it anyway, the server stops it before the flow runs.
+To run it, reschedule it, for example with `prefect flow-run retry`.
 </Warning>
 
 ## Cancel through the REST API
