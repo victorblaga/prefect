@@ -9,13 +9,19 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 import sqlalchemy as sa
 from docket import CurrentDocket, Depends, Docket, Logged, Perpetual, Retry
+from sqlalchemy.ext.asyncio import AsyncSession
 
 import prefect.server.models as models
 from prefect._internal.uuid7 import uuid7
 from prefect.client.schemas.worker_channel import CANCELLING_TIMEOUT_TEARDOWN
 from prefect.logging import get_logger
-from prefect.server.database import PrefectDBInterface, provide_database_interface
+from prefect.server.database import (
+    PrefectDBInterface,
+    orm_models,
+    provide_database_interface,
+)
 from prefect.server.exceptions import ObjectNotFoundError
+from prefect.server.orchestration.core_policy import CoreFlowPolicy
 from prefect.server.schemas import filters, responses, states
 from prefect.server.services.perpetual_services import perpetual_service
 from prefect.server.worker_communication.cleanup_queue import (
@@ -30,7 +36,12 @@ NON_TERMINAL_STATES = list(set(states.StateType) - states.TERMINAL_STATES)
 CANCELLING_TIMEOUT_CANCELLED_MESSAGE = (
     "Flow run cancellation timed out; marked this flow run as Cancelled."
 )
+CANCELLED_BEFORE_START_MESSAGE = (
+    "Flow run was cancelled before it started; requested teardown of its "
+    "infrastructure from the workers in its work pool that support it."
+)
 CANCELLING_TIMEOUT_CHECK_KEY_PREFIX = "cancelling-timeout"
+CANCEL_BEFORE_START_KEY_PREFIX = "cancel-before-start"
 PUSH_WORK_POOL_TYPE_SUFFIX = ":push"
 MANAGED_WORK_POOL_TYPE_SUFFIX = ":managed"
 logger: logging.Logger = get_logger(__name__)
@@ -52,6 +63,10 @@ def _get_service_worker_cleanup_queue() -> WorkerCleanupQueue:
 
 def cancelling_timeout_check_key(flow_run_id: UUID) -> str:
     return f"{CANCELLING_TIMEOUT_CHECK_KEY_PREFIX}:{flow_run_id}"
+
+
+def cancel_before_start_key(flow_run_id: UUID) -> str:
+    return f"{CANCEL_BEFORE_START_KEY_PREFIX}:{flow_run_id}"
 
 
 async def schedule_cancelling_timeout_check(
@@ -95,6 +110,11 @@ async def maybe_schedule_cancelling_timeout_check_for_state(
         when=state.timestamp
         + datetime.timedelta(seconds=settings.cancelling_timeout_seconds),
     )
+    await docket.replace(
+        cancel_flow_run_before_start,
+        key=cancel_before_start_key(flow_run_id),
+        when=state.timestamp,
+    )(flow_run_id=flow_run_id, flow_run_state_id=state.id)
 
 
 # Docket task function for cancelling child task runs of a cancelled flow run
@@ -191,6 +211,108 @@ async def cancel_subflow_run(
         )
 
 
+async def cancel_flow_run_before_start(
+    flow_run_id: Annotated[UUID, Logged],
+    flow_run_state_id: Annotated[UUID, Logged],
+    *,
+    db: PrefectDBInterface = Depends(provide_database_interface),
+    cleanup_queue: WorkerCleanupQueue = Depends(_get_service_worker_cleanup_queue),
+    retry: Retry = Retry.forever(delay=datetime.timedelta(seconds=0.5)),
+) -> CleanupQueueMessage | None:
+    """
+    Mark a CANCELLING flow run that has never started as Cancelled and request
+    teardown of its infrastructure (docket task).
+
+    A flow run has never started when its `start_time` is unset; one whose
+    earlier attempt ended without running already has a `start_time` and is left
+    to the CANCELLING timeout check. Once its worker has submitted it, only its
+    runtime or the CANCELLING timeout check would act on the cancellation of a
+    flow run that has never started. If its infrastructure is known and its work
+    pool has workers, the flow run is marked
+    Cancelled right away and teardown of the infrastructure last recorded for it
+    is requested from those workers; workers that cannot tear down infrastructure
+    leave the request alone. A runtime that starts anyway cannot run the flow:
+    orchestration aborts its transition to Running
+    (`PreventStartingFlowRunsCancelledBeforeStart`). Flow runs that have started,
+    or that have no workers, are left to their runtime, their worker, or the
+    CANCELLING timeout check.
+    """
+    async with db.session_context(
+        begin_transaction=True, with_for_update=True
+    ) as session:
+        row = await _read_flow_run_for_teardown(db, session, flow_run_id)
+        if row is None:
+            return None
+
+        flow_run, work_pool_id, work_pool_type = row
+        if (
+            flow_run.state_id != flow_run_state_id
+            or flow_run.state_type != states.StateType.CANCELLING
+            or flow_run.start_time is not None
+            or not flow_run.infrastructure_pid
+        ):
+            return None
+
+        # Logged at debug: the flow run stays CANCELLING, so the request is
+        # repeated on every `ensure_cancelling_timeout_checks` pass, and the
+        # CANCELLING timeout check reports the same reason once.
+        if flow_run.work_queue_id is None or work_pool_id is None:
+            logger.debug(
+                "Skipping cancellation before start for unroutable flow run: "
+                "flow_run_id=%s work_queue_id=%s",
+                flow_run.id,
+                flow_run.work_queue_id,
+            )
+            return None
+
+        if _is_workerless_work_pool_type(work_pool_type):
+            logger.debug(
+                "Skipping cancellation before start for workerless work pool flow "
+                "run: flow_run_id=%s work_pool_id=%s work_pool_type=%s",
+                flow_run.id,
+                work_pool_id,
+                work_pool_type,
+            )
+            return None
+
+        state_result = await models.flow_runs.set_flow_run_state(
+            session=session,
+            flow_run_id=flow_run.id,
+            state=states.Cancelled(message=CANCELLED_BEFORE_START_MESSAGE),
+            flow_policy=CoreFlowPolicy,
+        )
+        if state_result.status != responses.SetStateStatus.ACCEPT:
+            logger.info(
+                "Cancelled state transition for flow run %s cancelled before it "
+                "started was not accepted",
+                flow_run.id,
+                extra={
+                    "status": state_result.status.value,
+                    "reason": getattr(state_result.details, "reason", None),
+                },
+            )
+            return None
+
+        message = await _enqueue_infrastructure_teardown(
+            cleanup_queue,
+            flow_run=flow_run,
+            work_pool_id=work_pool_id,
+            # keyed by the CANCELLING state, so a retried task reuses the message
+            idempotency_key=(
+                f"{CANCELLING_TIMEOUT_TEARDOWN}:before-start:"
+                f"{flow_run.id}:{flow_run_state_id}"
+            ),
+        )
+
+    logger.info(
+        "Cancelled flow run before it started and enqueued its teardown: "
+        "flow_run_id=%s message_id=%s",
+        flow_run_id,
+        message.message_id,
+    )
+    return message
+
+
 async def handle_cancelling_timeout(
     flow_run_id: Annotated[UUID, Logged],
     flow_run_state_id: Annotated[UUID, Logged],
@@ -203,19 +325,10 @@ async def handle_cancelling_timeout(
     """Handle a scheduled CANCELLING timeout check for a single flow run."""
     settings = get_current_settings().server.services.cancellation_cleanup
 
-    async with db.session_context(begin_transaction=True) as session:
-        flow_run_result = await session.execute(
-            sa.select(
-                db.FlowRun,
-                db.WorkQueue.work_pool_id,
-                db.WorkPool.type,
-            )
-            .outerjoin(db.WorkQueue, db.FlowRun.work_queue_id == db.WorkQueue.id)
-            .outerjoin(db.WorkPool, db.WorkQueue.work_pool_id == db.WorkPool.id)
-            .where(db.FlowRun.id == flow_run_id)
-            .with_for_update(of=db.FlowRun)
-        )
-        row = flow_run_result.first()
+    async with db.session_context(
+        begin_transaction=True, with_for_update=True
+    ) as session:
+        row = await _read_flow_run_for_teardown(db, session, flow_run_id)
         if row is None:
             logger.info(
                 "Flow run %s no longer exists, skipping CANCELLING timeout",
@@ -262,8 +375,6 @@ async def handle_cancelling_timeout(
                 return None
 
             try:
-                from prefect.server.orchestration.core_policy import CoreFlowPolicy
-
                 state_result = await models.flow_runs.set_flow_run_state(
                     session=session,
                     flow_run_id=flow_run.id,
@@ -319,10 +430,7 @@ async def handle_cancelling_timeout(
             )
             return None
 
-        work_pool_type = str(work_pool_type) if work_pool_type else None
-        if work_pool_type and work_pool_type.endswith(
-            (PUSH_WORK_POOL_TYPE_SUFFIX, MANAGED_WORK_POOL_TYPE_SUFFIX)
-        ):
+        if _is_workerless_work_pool_type(work_pool_type):
             logger.info(
                 "Skipping CANCELLING timeout cleanup for workerless work pool flow "
                 "run: flow_run_id=%s work_queue_id=%s work_pool_id=%s "
@@ -334,27 +442,15 @@ async def handle_cancelling_timeout(
             )
             return None
 
-        cleanup_enqueue_parameters = {
-            "message_id": uuid5(
-                NAMESPACE_URL,
-                "prefect:"
-                f"{CANCELLING_TIMEOUT_TEARDOWN}:"
-                f"{flow_run.id}:{timeout_cancelled_state_id}",
-            ),
-            "idempotency_key": (
+        message = await _enqueue_infrastructure_teardown(
+            cleanup_queue,
+            flow_run=flow_run,
+            work_pool_id=work_pool_id,
+            idempotency_key=(
                 f"{CANCELLING_TIMEOUT_TEARDOWN}:"
                 f"{flow_run.id}:{timeout_cancelled_state_id}"
             ),
-            "work_pool_id": work_pool_id,
-            "work_queue_id": flow_run.work_queue_id,
-            "kind": CANCELLING_TIMEOUT_TEARDOWN,
-            "target": {
-                "flow_run_id": str(flow_run.id),
-                "infrastructure_pid": flow_run.infrastructure_pid,
-            },
-        }
-
-        message = await cleanup_queue.enqueue(**cleanup_enqueue_parameters)
+        )
 
     logger.info(
         "Enqueued CANCELLING timeout cleanup message: flow_run_id=%s message_id=%s",
@@ -362,6 +458,59 @@ async def handle_cancelling_timeout(
         message.message_id,
     )
     return message
+
+
+async def _read_flow_run_for_teardown(
+    db: PrefectDBInterface, session: AsyncSession, flow_run_id: UUID
+) -> tuple[orm_models.FlowRun, UUID | None, str | None] | None:
+    """
+    Lock a flow run and read the work pool its infrastructure teardown is routed
+    to.
+    """
+    flow_run_result = await session.execute(
+        sa.select(
+            db.FlowRun,
+            db.WorkQueue.work_pool_id,
+            db.WorkPool.type,
+        )
+        .outerjoin(db.WorkQueue, db.FlowRun.work_queue_id == db.WorkQueue.id)
+        .outerjoin(db.WorkPool, db.WorkQueue.work_pool_id == db.WorkPool.id)
+        .where(db.FlowRun.id == flow_run_id)
+        .with_for_update(of=db.FlowRun)
+    )
+    row = flow_run_result.first()
+    if row is None:
+        return None
+
+    flow_run, work_pool_id, work_pool_type = row
+    return flow_run, work_pool_id, work_pool_type
+
+
+def _is_workerless_work_pool_type(work_pool_type: str | None) -> bool:
+    return bool(work_pool_type) and str(work_pool_type).endswith(
+        (PUSH_WORK_POOL_TYPE_SUFFIX, MANAGED_WORK_POOL_TYPE_SUFFIX)
+    )
+
+
+async def _enqueue_infrastructure_teardown(
+    cleanup_queue: WorkerCleanupQueue,
+    *,
+    flow_run: orm_models.FlowRun,
+    work_pool_id: UUID,
+    idempotency_key: str,
+) -> CleanupQueueMessage:
+    """Ask the workers in a work pool to tear down a flow run's infrastructure."""
+    return await cleanup_queue.enqueue(
+        message_id=uuid5(NAMESPACE_URL, f"prefect:{idempotency_key}"),
+        idempotency_key=idempotency_key,
+        work_pool_id=work_pool_id,
+        work_queue_id=flow_run.work_queue_id,
+        kind=CANCELLING_TIMEOUT_TEARDOWN,
+        target={
+            "flow_run_id": str(flow_run.id),
+            "infrastructure_pid": flow_run.infrastructure_pid,
+        },
+    )
 
 
 @perpetual_service(
@@ -379,7 +528,10 @@ async def ensure_cancelling_timeout_checks(
         ),
     ),
 ) -> None:
-    """Seed Docket timeout checks for flow runs already in CANCELLING."""
+    """
+    Seed Docket timeout checks for flow runs already in CANCELLING, and
+    cancellation before start for those that never started.
+    """
 
     settings = get_current_settings().server.services.cancellation_cleanup
     batch_size = 200
@@ -408,6 +560,8 @@ async def ensure_cancelling_timeout_checks(
                 db.FlowRun.id,
                 db.FlowRun.state_id,
                 db.FlowRun.state_timestamp,
+                db.FlowRun.start_time,
+                db.FlowRun.infrastructure_pid,
             )
             .where(*query_conditions)
             .order_by(db.FlowRun.state_timestamp, db.FlowRun.id)
@@ -421,7 +575,13 @@ async def ensure_cancelling_timeout_checks(
         if not cancelling_flow_runs:
             break
 
-        for flow_run_id, flow_run_state_id, state_timestamp in cancelling_flow_runs:
+        for (
+            flow_run_id,
+            flow_run_state_id,
+            state_timestamp,
+            start_time,
+            infrastructure_pid,
+        ) in cancelling_flow_runs:
             await docket.add(
                 handle_cancelling_timeout,
                 key=cancelling_timeout_check_key(flow_run_id),
@@ -432,8 +592,19 @@ async def ensure_cancelling_timeout_checks(
                 flow_run_state_id=flow_run_state_id,
                 timeout_cancelled_state_id=uuid7(),
             )
+            # The cancellation scheduled when the flow run entered CANCELLING may
+            # not have run before a restart, or may have found no
+            # `infrastructure_pid` because the worker recorded it later. A flow
+            # run it cancelled is no longer CANCELLING, so this repeats on every
+            # pass only for flow runs it leaves alone, where it does nothing.
+            if start_time is None and infrastructure_pid:
+                await docket.add(
+                    cancel_flow_run_before_start,
+                    key=cancel_before_start_key(flow_run_id),
+                    when=state_timestamp,
+                )(flow_run_id=flow_run_id, flow_run_state_id=flow_run_state_id)
 
-        last_flow_run_id, _, last_state_timestamp = cancelling_flow_runs[-1]
+        last_flow_run_id, _, last_state_timestamp, _, _ = cancelling_flow_runs[-1]
         if len(cancelling_flow_runs) < batch_size:
             break
 

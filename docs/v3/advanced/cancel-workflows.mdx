@@ -72,6 +72,8 @@ depending on where the error occurred. The worker will try again to cancel the f
 If a flow run remains in `CANCELLING` for longer than the cancelling timeout (default: 300 seconds), the server automatically transitions it to `CANCELLED`.
 This acts as a safety net when a worker is unavailable or fails to complete the cancellation process.
 To adjust the timeout, set `PREFECT_SERVER_SERVICES_CANCELLATION_CLEANUP_CANCELLING_TIMEOUT_SECONDS` to the desired number of seconds.
+
+If a flow run that has never started is cancelled after its infrastructure was created, the server marks it `CANCELLED` right away and asks the workers in its work pool to tear down the infrastructure last recorded for it. Workers that cannot tear down infrastructure, such as process workers, leave it running.
 </Note>
 
 ## Cancel through the CLI
@@ -117,7 +119,7 @@ print(result.status)
 Do not force a running flow run directly into the terminal `CANCELLED` state
 to request cancellation.
 `CANCELLING` signals that execution should stop and infrastructure should be cleaned up.
-`CANCELLED` is the final state after cancellation is complete, or when there is no running infrastructure to stop.
+`CANCELLED` is the final state of a cancelled flow run; infrastructure cleanup may still be in progress.
 A worker-launched flow run that is cancelled before it starts does not run: if its infrastructure starts it anyway, the server stops it before the flow runs.
 To run it, reschedule it, for example with `prefect flow-run retry`.
 </Warning>

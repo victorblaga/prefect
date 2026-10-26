@@ -53,8 +53,12 @@ class WorkerSettings(PrefectBaseSettings):
         default=False,
         description=(
             "Enable worker-side flow run cancellation for pending flow runs. "
-            "When enabled, the worker will terminate infrastructure for flow runs "
-            "that are cancelled while still in PENDING state (before the runner starts)."
+            "When enabled, the worker tries to terminate infrastructure for flow "
+            "runs that are cancelled while it is still submitting them (before the "
+            "runner starts). Independently of this setting, the server marks a flow "
+            "run that is cancelled after submission but has never started as "
+            "Cancelled, and asks the workers in its work pool to tear down its "
+            "infrastructure."
         ),
     )
 

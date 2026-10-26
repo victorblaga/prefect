@@ -28,8 +28,9 @@ if TYPE_CHECKING:
 class CancellingTimeoutTeardownHandler:
     """Idempotent infrastructure teardown for `cancelling_timeout_teardown.v1`.
 
-    The cleanup message is enqueued after the server has already committed
-    the CANCELLING-timeout state outcome. Boundary contract:
+    The server enqueues the cleanup message in the transaction that commits
+    the flow run's Cancelled state, either for a flow run cancelled before it
+    started or as the CANCELLING-timeout state outcome. Boundary contract:
 
     - Does not propose or force flow-run state transitions.
     - Does not require the flow run to currently be in `CANCELLING` and

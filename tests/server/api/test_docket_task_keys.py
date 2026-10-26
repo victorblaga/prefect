@@ -23,7 +23,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from prefect._internal.compatibility.starlette import status
 from prefect.server import models, schemas
 from prefect.server.schemas.statuses import DeploymentStatus
-from prefect.server.services.cancellation_cleanup import cancelling_timeout_check_key
+from prefect.server.services.cancellation_cleanup import (
+    cancel_before_start_key,
+    cancelling_timeout_check_key,
+)
 from prefect.settings import (
     PREFECT_SERVER_SERVICES_CANCELLATION_CLEANUP_ENABLED,
     get_current_settings,
@@ -198,11 +201,12 @@ class TestDocketAtMostOnceExecution:
 
         final_snapshot = await real_docket.snapshot()
         new_tasks = final_snapshot.total_tasks - initial_task_count
-        assert new_tasks == 1
+        assert new_tasks == 2
 
         task_keys = {task.key for task in final_snapshot.future}
         task_keys.update(task.key for task in final_snapshot.running)
         assert cancelling_timeout_check_key(flow_run.id) in task_keys
+        assert cancel_before_start_key(flow_run.id) in task_keys
 
     async def test_bulk_cancelling_flow_run_state_queues_timeout_check(
         self,
@@ -236,11 +240,12 @@ class TestDocketAtMostOnceExecution:
 
         final_snapshot = await real_docket.snapshot()
         new_tasks = final_snapshot.total_tasks - initial_task_count
-        assert new_tasks == 1
+        assert new_tasks == 2
 
         task_keys = {task.key for task in final_snapshot.future}
         task_keys.update(task.key for task in final_snapshot.running)
         assert cancelling_timeout_check_key(flow_run.id) in task_keys
+        assert cancel_before_start_key(flow_run.id) in task_keys
 
     async def test_work_queue_duplicate_requests_queue_single_task(
         self,

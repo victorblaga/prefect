@@ -13,6 +13,7 @@ from prefect.server.models.deployments import mark_deployments_ready
 from prefect.server.models.work_queues import mark_work_queues_ready
 from prefect.server.services.cancellation_cleanup import (
     cancel_child_task_runs,
+    cancel_flow_run_before_start,
     cancel_subflow_run,
     handle_cancelling_timeout,
 )
@@ -42,6 +43,7 @@ task_functions: list[Callable[..., Any]] = [
     delete_flow_run_logs,
     # Find-and-flood pattern tasks used by perpetual services
     handle_cancelling_timeout,
+    cancel_flow_run_before_start,
     cancel_child_task_runs,
     cancel_subflow_run,
     fail_expired_pause,
